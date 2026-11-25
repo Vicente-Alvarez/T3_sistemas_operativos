@@ -1,0 +1,831 @@
+﻿=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\.gitignore ===
+*.o
+simulador
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\acceso.c ===
+#include <stdio.h>
+#include <stdlib.h>
+#include "disco.h"
+
+int acceder_posicion_aleatoria(Disco *d)
+{
+    int t = d->segundos;
+    int activos = 0;
+    for (int i = 0; i < d->n_archivos; i++)
+        if (d->archivos[i].activo)
+            activos++;
+
+    if (activos == 0) {
+        printf("[t=%ds] ACCESO: no hay archivos activos\n", t);
+        return 0;
+    }
+
+    int elegido = rand() % activos;
+    Archivo *a = NULL;
+    for (int i = 0; i < d->n_archivos; i++) {
+        if (!d->archivos[i].activo)
+            continue;
+        if (elegido == 0) {
+            a = &d->archivos[i];
+            break;
+        }
+        elegido--;
+    }
+
+    long bytes = (long)a->tam_kb * 1024;
+    long pos = (long)rand() % bytes;
+
+    long util = d->bloque_bytes;
+    if (d->mec == ENLAZADA)
+        util -= TAM_PUNTERO;
+
+    int idx = (int)(pos / util);
+    if (idx >= a->n_datos)
+        idx = a->n_datos - 1;
+
+    int fisico = a->datos[idx];
+    int bloque_indice = -1;
+    int accesos;
+
+    switch (d->mec) {
+    case CONTIGUA:
+        accesos = 1;
+        break;
+    case ENLAZADA:
+        accesos = idx + 1;
+        break;
+    default: {
+        int nro_indice = idx / indice_cap(d, a->n_datos);
+        bloque_indice = a->meta[nro_indice];
+        accesos = nro_indice + 2;
+        break;
+    }
+    }
+
+    d->n_accesos++;
+    d->suma_accesos += accesos;
+
+    printf("[t=%ds] ACCESO: archivo %d, posicion logica %ld (bloque logico %d) -> bloque fisico %d",
+           t, a->id, pos, idx, fisico);
+    if (d->mec == INDEXADA)
+        printf(" (bloque indice %d)", bloque_indice);
+    printf(", accesos: %d\n", accesos);
+
+    return accesos;
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\asignacion.c ===
+#include <stdlib.h>
+#include "disco.h"
+
+int indice_cap(const Disco *d, int n_datos)
+{
+    int punteros_por_bloque = d->bloque_bytes / TAM_PUNTERO;
+
+    if (n_datos <= punteros_por_bloque)
+        return punteros_por_bloque;
+    return punteros_por_bloque - 1;
+}
+
+static void bloques_necesarios(const Disco *d, long bytes,
+                               int *cant_datos, int *cant_meta)
+{
+    *cant_meta = 0;
+
+    switch (d->mec) {
+    case CONTIGUA:
+        *cant_datos = (int)div_techo(bytes, d->bloque_bytes);
+        break;
+    case ENLAZADA:
+        *cant_datos = (int)div_techo(bytes, d->bloque_bytes - TAM_PUNTERO);
+        break;
+    default:
+        *cant_datos = (int)div_techo(bytes, d->bloque_bytes);
+        *cant_meta = (int)div_techo(*cant_datos, indice_cap(d, *cant_datos));
+        break;
+    }
+}
+
+static int primer_hueco(const Disco *d, int necesarios)
+{
+    int comienzo = 0;
+    int seguidos = 0;
+
+    for (int b = 0; b < d->total_bloques; b++) {
+        if (d->mapa[b] == -1) {
+            if (seguidos == 0)
+                comienzo = b;
+            seguidos++;
+            if (seguidos == necesarios)
+                return comienzo;
+        } else {
+            seguidos = 0;
+        }
+    }
+    return -1;
+}
+
+static void reservar_libres(const Disco *d, int *meta, int cant_meta,
+                            int *datos, int cant_datos)
+{
+    int k_meta = 0;
+    int k_datos = 0;
+
+    for (int b = 0; b < d->total_bloques; b++) {
+        if (k_meta >= cant_meta && k_datos >= cant_datos)
+            break;
+        if (d->mapa[b] != -1)
+            continue;
+        if (k_meta < cant_meta)
+            meta[k_meta++] = b;
+        else
+            datos[k_datos++] = b;
+    }
+}
+
+int asignar_archivo(Disco *d, int tam_kb, int *idx_out)
+{
+    long bytes = (long)tam_kb * 1024;
+    int cant_datos, cant_meta;
+
+    bloques_necesarios(d, bytes, &cant_datos, &cant_meta);
+
+    if (cant_datos + cant_meta > d->libres)
+        return ASIG_SIN_ESPACIO;
+
+    int *datos = malloc(sizeof(int) * cant_datos);
+    int *meta = cant_meta > 0 ? malloc(sizeof(int) * cant_meta) : NULL;
+    if (datos == NULL || (cant_meta > 0 && meta == NULL)) {
+        free(datos);
+        free(meta);
+        return ASIG_SIN_ESPACIO;
+    }
+
+    if (d->mec == CONTIGUA) {
+        int comienzo = primer_hueco(d, cant_datos);
+        if (comienzo < 0) {
+            free(datos);
+            return ASIG_FRAGMENTACION;
+        }
+        for (int i = 0; i < cant_datos; i++)
+            datos[i] = comienzo + i;
+    } else {
+        reservar_libres(d, meta, cant_meta, datos, cant_datos);
+    }
+
+    int pos = disco_nuevo_archivo(d, tam_kb, datos, cant_datos, meta, cant_meta);
+    if (pos < 0) {
+        free(datos);
+        free(meta);
+        return ASIG_SIN_ESPACIO;
+    }
+    *idx_out = pos;
+    return ASIG_OK;
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\disco.c ===
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "disco.h"
+
+long div_techo(long a, long b)
+{
+    return (a + b - 1) / b;
+}
+
+const char *nombre_mecanismo(Mecanismo m)
+{
+    switch (m) {
+    case CONTIGUA: return "contigua";
+    case ENLAZADA: return "enlazada";
+    default:       return "indexada";
+    }
+}
+
+int disco_init(Disco *d, int disco_mb, int bloque_kb, Mecanismo mec,
+               int min_kb, int max_kb)
+{
+    long cantidad = (long)disco_mb * 1024 / bloque_kb;
+
+    memset(d, 0, sizeof(*d));
+    if (cantidad < 2)
+        return -1;
+
+    d->total_bloques = (int)cantidad;
+    d->bloque_bytes = bloque_kb * 1024;
+    d->mec = mec;
+    d->min_kb = min_kb;
+    d->max_kb = max_kb;
+
+    d->mapa = malloc(sizeof(int) * d->total_bloques);
+    if (d->mapa == NULL)
+        return -1;
+    for (int b = 0; b < d->total_bloques; b++)
+        d->mapa[b] = -1;
+    d->libres = d->total_bloques;
+    return 0;
+}
+
+void disco_destruir(Disco *d)
+{
+    for (int i = 0; i < d->n_archivos; i++) {
+        free(d->archivos[i].datos);
+        free(d->archivos[i].meta);
+    }
+    free(d->archivos);
+    free(d->mapa);
+    memset(d, 0, sizeof(*d));
+}
+
+int disco_nuevo_archivo(Disco *d, int tam_kb, int *datos, int n_datos,
+                        int *meta, int n_meta)
+{
+    if (d->n_archivos == d->cap_archivos) {
+        int nueva_cap = d->cap_archivos ? d->cap_archivos * 2 : 64;
+        Archivo *nuevo = realloc(d->archivos, sizeof(Archivo) * nueva_cap);
+        if (nuevo == NULL)
+            return -1;
+        d->archivos = nuevo;
+        d->cap_archivos = nueva_cap;
+    }
+
+    int pos = d->n_archivos++;
+    Archivo *arch = &d->archivos[pos];
+    arch->id = pos + 1;
+    arch->tam_kb = tam_kb;
+    arch->activo = 1;
+    arch->n_datos = n_datos;
+    arch->datos = datos;
+    arch->n_meta = n_meta;
+    arch->meta = meta;
+
+    for (int i = 0; i < n_datos; i++)
+        d->mapa[datos[i]] = arch->id;
+    for (int i = 0; i < n_meta; i++)
+        d->mapa[meta[i]] = arch->id;
+
+    d->libres -= n_datos + n_meta;
+    d->activos++;
+    d->creados++;
+    return pos;
+}
+
+void disco_liberar_archivo(Disco *d, int pos)
+{
+    Archivo *arch = &d->archivos[pos];
+
+    for (int i = 0; i < arch->n_datos; i++)
+        d->mapa[arch->datos[i]] = -1;
+    for (int i = 0; i < arch->n_meta; i++)
+        d->mapa[arch->meta[i]] = -1;
+
+    d->libres += arch->n_datos + arch->n_meta;
+    free(arch->datos);
+    free(arch->meta);
+    arch->datos = NULL;
+    arch->meta = NULL;
+    arch->activo = 0;
+    d->activos--;
+    d->eliminados++;
+}
+
+static void mostrar_rangos(const int *lista, int cantidad)
+{
+    int grupos = 0;
+    int inicio = 0;
+
+    while (inicio < cantidad) {
+        int fin = inicio;
+        while (fin + 1 < cantidad && lista[fin + 1] == lista[fin] + 1)
+            fin++;
+        if (grupos >= 8) {
+            printf("...");
+            return;
+        }
+        if (fin > inicio)
+            printf("%d-%d", lista[inicio], lista[fin]);
+        else
+            printf("%d", lista[inicio]);
+        grupos++;
+        inicio = fin + 1;
+        if (inicio < cantidad)
+            printf(", ");
+    }
+}
+
+void disco_imprimir_archivo(const Disco *d, int pos)
+{
+    const Archivo *arch = &d->archivos[pos];
+
+    printf("    Archivo #%d (%d KB): %d bloques de datos en [",
+           arch->id, arch->tam_kb, arch->n_datos);
+    mostrar_rangos(arch->datos, arch->n_datos);
+    printf("]");
+    if (arch->n_meta > 0) {
+        printf(", %d bloque(s) Ã­ndice en [", arch->n_meta);
+        mostrar_rangos(arch->meta, arch->n_meta);
+        printf("]");
+    }
+    printf("\n");
+}
+
+void disco_imprimir_mapa(const Disco *d)
+{
+    int columnas = d->total_bloques < 64 ? d->total_bloques : 64;
+
+    printf("    Disco [");
+    for (int col = 0; col < columnas; col++) {
+        long desde = (long)col * d->total_bloques / columnas;
+        long hasta = (long)(col + 1) * d->total_bloques / columnas;
+        long ocupados = 0;
+        for (long b = desde; b < hasta; b++)
+            if (d->mapa[b] != -1)
+                ocupados++;
+        if (ocupados == 0)
+            putchar('.');
+        else if (ocupados == hasta - desde)
+            putchar('#');
+        else
+            putchar('+');
+    }
+    printf("]  libres: %d de %d bloques\n", d->libres, d->total_bloques);
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\disco.h ===
+#ifndef DISCO_H
+#define DISCO_H
+
+#define TAM_PUNTERO 4
+
+#define ASIG_OK            0
+#define ASIG_SIN_ESPACIO   1
+#define ASIG_FRAGMENTACION 2
+
+typedef enum { CONTIGUA = 1, ENLAZADA = 2, INDEXADA = 3 } Mecanismo;
+
+typedef struct {
+    int id;
+    int tam_kb;
+    int activo;
+    int n_datos;
+    int *datos;
+    int n_meta;
+    int *meta;
+} Archivo;
+
+typedef struct {
+    int total_bloques;
+    int bloque_bytes;
+    Mecanismo mec;
+    int min_kb, max_kb;
+
+    int *mapa;
+    int libres;
+
+    Archivo *archivos;
+    int n_archivos;
+    int cap_archivos;
+    int activos;
+
+    int creados, eliminados;
+    long suma_accesos;
+    int n_accesos;
+
+    double frag_suma;
+    int frag_muestras;
+    double frag_max;
+
+    int segundos;
+} Disco;
+
+typedef struct {
+    int libres;
+    int huecos;
+    int mayor_hueco;
+    double porcentaje;
+} Fragmentacion;
+
+int  disco_init(Disco *d, int disco_mb, int bloque_kb, Mecanismo mec,
+                int min_kb, int max_kb);
+void disco_destruir(Disco *d);
+int  disco_nuevo_archivo(Disco *d, int tam_kb, int *datos, int n_datos,
+                         int *meta, int n_meta);
+void disco_liberar_archivo(Disco *d, int idx);
+void disco_imprimir_archivo(const Disco *d, int idx);
+void disco_imprimir_mapa(const Disco *d);
+const char *nombre_mecanismo(Mecanismo m);
+long div_techo(long a, long b);
+
+int asignar_archivo(Disco *d, int tam_kb, int *idx_out);
+int indice_cap(const Disco *d, int n_datos);
+
+void simulacion_ejecutar(Disco *d, int factor);
+
+int eliminar_archivo_aleatorio(Disco *d);
+
+int acceder_posicion_aleatoria(Disco *d);
+
+void calcular_fragmentacion(const Disco *d, Fragmentacion *f);
+void registrar_fragmentacion(Disco *d);
+
+void imprimir_estadisticas(Disco *d);
+
+#endif
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\eliminacion.c ===
+#include <stdio.h>
+#include <stdlib.h>
+#include "disco.h"
+
+int eliminar_archivo_aleatorio(Disco *d)
+{
+    int t = d->segundos;
+    int activos = 0;
+    for (int i = 0; i < d->n_archivos; i++)
+        if (d->archivos[i].activo)
+            activos++;
+
+    if (activos == 0) {
+        printf("[t=%ds] ELIMINACION: no hay archivos activos\n", t);
+        return 0;
+    }
+
+    int elegido = rand() % activos;
+    int pos = -1;
+    for (int i = 0; i < d->n_archivos; i++) {
+        if (!d->archivos[i].activo)
+            continue;
+        if (elegido == 0) {
+            pos = i;
+            break;
+        }
+        elegido--;
+    }
+
+    int id = d->archivos[pos].id;
+    int liberados = d->archivos[pos].n_datos + d->archivos[pos].n_meta;
+    int tam_kb = d->archivos[pos].tam_kb;
+
+    disco_liberar_archivo(d, pos);
+
+    printf("[t=%ds] ELIMINACION: archivo %d (%d KB) eliminado, %d bloques liberados\n",
+           t, id, tam_kb, liberados);
+    return 1;
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\estadisticas.c ===
+#include <stdio.h>
+#include "disco.h"
+
+void imprimir_estadisticas(Disco *d)
+{
+    int usados = d->total_bloques - d->libres;
+    int datos = 0;
+    int indices = 0;
+
+    for (int i = 0; i < d->n_archivos; i++) {
+        if (d->archivos[i].activo) {
+            datos += d->archivos[i].n_datos;
+            indices += d->archivos[i].n_meta;
+        }
+    }
+
+    Fragmentacion f;
+    calcular_fragmentacion(d, &f);
+
+    double uso = d->total_bloques > 0
+                     ? 100.0 * usados / d->total_bloques
+                     : 0.0;
+    double prom_frag = d->frag_muestras > 0
+                           ? d->frag_suma / d->frag_muestras
+                           : 0.0;
+    double prom_acc = d->n_accesos > 0
+                          ? (double)d->suma_accesos / d->n_accesos
+                          : 0.0;
+
+    printf("\n ESTADISTICAS FINALES \n");
+    printf("Mecanismo de asignacion:    %s\n", nombre_mecanismo(d->mec));
+    printf("Tiempo simulado:            %d s\n", d->segundos);
+    printf("Bloques totales:            %d\n", d->total_bloques);
+    printf("Bloques usados:             %d (%.2f%%)\n", usados, uso);
+    printf("Bloques libres:             %d (%.2f%%)\n", d->libres, 100.0 - uso);
+    printf("Bloques de datos:           %d\n", datos);
+    if (d->mec == INDEXADA)
+        printf("Bloques indice:             %d\n", indices);
+    if (d->mec == ENLAZADA)
+        printf("Espacio de punteros:        %.2f KB\n",
+               (double)datos * TAM_PUNTERO / 1024.0);
+    printf("Archivos creados:           %d\n", d->creados);
+    printf("Archivos eliminados:        %d\n", d->eliminados);
+    printf("Archivos activos:           %d\n", d->activos);
+    printf("Fragmentacion externa:      %.2f%% (final)\n", f.porcentaje);
+    printf("Fragmentacion externa max:  %.2f%%\n", d->frag_max);
+    printf("Fragmentacion externa prom: %.2f%%\n", prom_frag);
+    printf("Accesos logicos realizados: %d\n", d->n_accesos);
+    printf("Promedio de accesos/bloque: %.2f\n", prom_acc);
+    printf("\n");
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\fragmentacion.c ===
+#include <stdio.h>
+#include "disco.h"
+
+void calcular_fragmentacion(const Disco *d, Fragmentacion *f)
+{
+    int actual = 0;
+
+    f->libres = 0;
+    f->huecos = 0;
+    f->mayor_hueco = 0;
+
+    for (int i = 0; i < d->total_bloques; i++) {
+        if (d->mapa[i] == -1) {
+            if (actual == 0)
+                f->huecos++;
+            f->libres++;
+            actual++;
+            if (actual > f->mayor_hueco)
+                f->mayor_hueco = actual;
+        } else {
+            actual = 0;
+        }
+    }
+
+    if (f->libres == 0)
+        f->porcentaje = 0.0;
+    else
+        f->porcentaje = (1.0 - (double)f->mayor_hueco / (double)f->libres) * 100.0;
+}
+
+void registrar_fragmentacion(Disco *d)
+{
+    Fragmentacion f;
+
+    calcular_fragmentacion(d, &f);
+
+    if (f.porcentaje > d->frag_max)
+        d->frag_max = f.porcentaje;
+    d->frag_suma += f.porcentaje;
+    d->frag_muestras++;
+
+    printf("[t=%ds] FRAGMENTACION EXTERNA: %.2f%% (%d bloques libres en %d huecos)\n",
+           d->segundos, f.porcentaje, f.libres, f.huecos);
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\main.c ===
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "disco.h"
+
+static void vaciar_entrada(void)
+{
+    int ch;
+    while ((ch = getchar()) != '\n' && ch != EOF)
+        ;
+}
+
+static int pedir_entero(const char *mensaje, int minimo)
+{
+    int valor;
+
+    for (;;) {
+        printf("%s", mensaje);
+        if (scanf("%d", &valor) == 1 && valor >= minimo) {
+            vaciar_entrada();
+            return valor;
+        }
+        if (feof(stdin)) {
+            printf("\nEntrada cerrada, saliendo.\n");
+            exit(1);
+        }
+        vaciar_entrada();
+        printf("  Valor invÃ¡lido (debe ser un entero >= %d).\n", minimo);
+    }
+}
+
+static Mecanismo pedir_mecanismo(void)
+{
+    char texto[64];
+
+    for (;;) {
+        printf("Mecanismo de asignaciÃ³n (contigua / enlazada / indexada): ");
+        if (scanf("%63s", texto) != 1) {
+            printf("\nEntrada cerrada, saliendo.\n");
+            exit(1);
+        }
+        vaciar_entrada();
+        for (char *c = texto; *c; c++)
+            *c = (char)tolower((unsigned char)*c);
+
+        if (strcmp(texto, "contigua") == 0 || strcmp(texto, "1") == 0)
+            return CONTIGUA;
+        if (strcmp(texto, "enlazada") == 0 || strcmp(texto, "2") == 0)
+            return ENLAZADA;
+        if (strcmp(texto, "indexada") == 0 || strcmp(texto, "3") == 0)
+            return INDEXADA;
+        printf("  OpciÃ³n invÃ¡lida.\n");
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    int velocidad = 1;
+    Disco disco;
+
+    if (argc > 1) {
+        velocidad = atoi(argv[1]);
+        if (velocidad < 1 || velocidad > 1000)
+            velocidad = 1;
+    }
+
+    printf("=== Simulador de asignaciÃ³n de archivos ===\n\n");
+
+    int disco_mb = pedir_entero("TamaÃ±o del disco (MB): ", 1);
+    int bloque_kb = pedir_entero("TamaÃ±o de cada bloque (KB): ", 1);
+    Mecanismo mecanismo = pedir_mecanismo();
+    int min_kb = pedir_entero("TamaÃ±o mÃ­nimo de archivo (KB): ", 1);
+    int max_kb = pedir_entero("TamaÃ±o mÃ¡ximo de archivo (KB): ", min_kb);
+
+    if (disco_init(&disco, disco_mb, bloque_kb, mecanismo, min_kb, max_kb) != 0) {
+        fprintf(stderr, "Error: el disco debe tener al menos 2 bloques.\n");
+        return 1;
+    }
+
+    simulacion_ejecutar(&disco, velocidad);
+    disco_destruir(&disco);
+    return 0;
+}
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\Makefile ===
+CC = gcc
+CFLAGS = -Wall -Wextra -std=gnu11 -g
+SRC = main.c disco.c asignacion.c simulacion.c eliminacion.c acceso.c fragmentacion.c estadisticas.c
+OBJ = $(SRC:.c=.o)
+
+simulador: $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $(OBJ)
+
+%.o: %.c disco.h
+	$(CC) $(CFLAGS) -c $<
+
+clean:
+	rm -f $(OBJ) simulador
+
+.PHONY: clean														
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\README.md ===
+# Operaciones y mÃ©tricas
+
+Esta parte cubre la eliminaciÃ³n periÃ³dica de archivos, el acceso a posiciones lÃ³gicas, la fragmentaciÃ³n externa y las estadÃ­sticas finales. Todo se apoya en `disco.h`, que define las estructuras compartidas con el nÃºcleo del disco.
+
+## Archivos
+
+| Archivo | FunciÃ³n | QuÃ© hace |
+|---|---|---|
+| `eliminacion.c` | `eliminar_archivo_aleatorio(t)` | Elige un archivo activo al azar, llama a `liberar_archivo()` y suma 1 a los eliminados. |
+| `acceso.c` | `acceder_posicion_logica(t)` | Elige un archivo activo y una posiciÃ³n lÃ³gica (en bytes) al azar, calcula el bloque lÃ³gico, muestra el bloque fÃ­sico y cuenta los accesos. |
+| `fragmentacion.c` | `calcular_fragmentacion_externa()` y `registrar_fragmentacion(t)` | Calcula la fragmentaciÃ³n, la muestra por pantalla y guarda Ãºltimo valor, mÃ¡ximo y promedio. |
+| `estadisticas.c` | `mostrar_estadisticas()` | Imprime el resumen final. AquÃ­ tambiÃ©n se define la variable global `metricas`. |
+
+## CÃ³mo se llaman (simulacion.c)
+
+Desde el segundo 30, cada 5 segundos:
+
+```c
+eliminar_archivo_aleatorio(t);
+acceder_posicion_logica(t);
+registrar_fragmentacion(t);
+```
+
+Al terminar la simulaciÃ³n (sin espacio o fragmentaciÃ³n que impide asignar):
+
+```c
+mostrar_estadisticas();
+```
+
+`t` es el segundo actual de la simulaciÃ³n, solo se usa para imprimir.
+
+## QuÃ© se necesita del nÃºcleo del disco
+
+- `Disco disco;` definido en algÃºn `.c` del nÃºcleo.
+- `mapa[i] == -1` significa bloque libre. Si estÃ¡ ocupado, guarda el id del archivo dueÃ±o.
+- Cada `Archivo` debe tener `bloques[]` con los bloques fÃ­sicos de datos **en orden lÃ³gico**, para los tres mecanismos (incluida contigua).
+- `liberar_archivo(Archivo *a)` debe poner `activo = 0` y marcar como `-1` en `mapa` todos los bloques del archivo (datos, punteros e Ã­ndice).
+- Los archivos creados se cuentan con `disco.n_archivos`, asÃ­ que no hace falta otro contador.
+- `bloque_indice` solo se usa en indexada (en los demÃ¡s mecanismos, `-1`).
+
+## CÃ³mo se cuentan los accesos
+
+| Mecanismo | Bloque lÃ³gico `k` | Accesos |
+|---|---|---|
+| Contigua | `pos / tam_bloque` | 1 |
+| Enlazada | `pos / (tam_bloque - TAM_PUNTERO)` | `k + 1` (se recorre la cadena desde el inicio) |
+| Indexada | `pos / tam_bloque` | 2 (bloque Ã­ndice + bloque de datos) |
+
+`TAM_PUNTERO` vale 4 bytes. Si usan Ã­ndices de varios niveles o encadenados, hay que ajustar el `switch` de `acceso.c`.
+
+## FragmentaciÃ³n externa
+
+```
+fragmentaciÃ³n = (1 - mayor_hueco_libre / total_bloques_libres) * 100
+```
+
+Se recorre `mapa` buscando huecos de bloques libres consecutivos. Con un solo hueco (o sin bloques libres) el resultado es 0 %.
+
+## EstadÃ­sticas finales
+
+Se muestran bloques totales, usados y libres, archivos creados, eliminados y activos, fragmentaciÃ³n externa (final, mÃ¡xima y promedio), accesos lÃ³gicos realizados y promedio de accesos por bloque.
+
+## Compilar
+
+```
+gcc -Wall -Wextra -o simulador main.c disco.c asignacion.c simulacion.c eliminacion.c acceso.c fragmentacion.c estadisticas.c
+```
+
+=== ARCHIVO: C:\Users\petea\Documents\T3_sistemas_operativos\simulacion.c ===
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <time.h>
+#include "disco.h"
+
+static volatile sig_atomic_t terminar = 0;
+
+static void al_interrumpir(int senal)
+{
+    (void)senal;
+    terminar = 1;
+}
+
+static void pausa_un_segundo(int velocidad)
+{
+    long nanos = 1000000000L / velocidad;
+    struct timespec espera;
+
+    espera.tv_sec = nanos / 1000000000L;
+    espera.tv_nsec = nanos % 1000000000L;
+    nanosleep(&espera, NULL);
+}
+
+static int nuevo_archivo(Disco *d)
+{
+    int tam = d->min_kb + rand() % (d->max_kb - d->min_kb + 1);
+    int pos;
+    int resultado = asignar_archivo(d, tam, &pos);
+
+    if (resultado == ASIG_OK) {
+        printf("[t=%ds] CREADO archivo #%d de %d KB\n",
+               d->segundos, d->archivos[pos].id, tam);
+        disco_imprimir_archivo(d, pos);
+        return 0;
+    }
+
+    printf("[t=%ds] No se pudo crear un archivo de %d KB: ",
+           d->segundos, tam);
+    if (resultado == ASIG_FRAGMENTACION)
+        printf("hay bloques libres pero la fragmentaciÃ³n externa "
+               "impide asignarlo de forma contigua.\n");
+    else
+        printf("no hay espacio suficiente en el disco.\n");
+    return -1;
+}
+
+void simulacion_ejecutar(Disco *d, int factor)
+{
+    srand((unsigned)time(NULL));
+    signal(SIGINT, al_interrumpir);
+
+    printf("\n=== Inicio de la simulaciÃ³n (asignaciÃ³n %s) ===\n",
+           nombre_mecanismo(d->mec));
+    printf("Bloques: %d de %d bytes | archivos entre %d y %d KB\n",
+           d->total_bloques, d->bloque_bytes, d->min_kb, d->max_kb);
+    printf("(Ctrl+C para terminar y ver estadÃ­sticas)\n\n");
+
+    while (!terminar) {
+        pausa_un_segundo(factor);
+        if (terminar)
+            break;
+        d->segundos++;
+
+        if (d->segundos % 2 == 0) {
+            if (nuevo_archivo(d) < 0)
+                break;
+        }
+
+        if (d->segundos >= 30 && d->segundos % 5 == 0) {
+            eliminar_archivo_aleatorio(d);
+            acceder_posicion_aleatoria(d);
+            registrar_fragmentacion(d);
+            disco_imprimir_mapa(d);
+        }
+    }
+
+    if (terminar)
+        printf("\nSimulaciÃ³n interrumpida por el usuario.\n");
+
+    imprimir_estadisticas(d);
+}
+
