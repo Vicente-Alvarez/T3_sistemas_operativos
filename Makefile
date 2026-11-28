@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=gnu11 -g
+CFLAGS = -Wall -Wextra -std=c17 -g
 SRC = main.c disco.c asignacion.c simulacion.c eliminacion.c acceso.c fragmentacion.c estadisticas.c
 OBJ = $(SRC:.c=.o)
 
@@ -12,4 +12,4 @@ simulador: $(OBJ)
 clean:
 	rm -f $(OBJ) simulador
 
-.PHONY: clean														
+.PHONY: clean

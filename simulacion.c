@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -50,7 +52,7 @@ void simulacion_ejecutar(Disco *d, int factor)
     srand((unsigned)time(NULL));
     signal(SIGINT, al_interrumpir);
 
-    printf("\n=== Inicio de la simulación (asignación %s) ===\n",
+    printf("\n  Inicio de la simulación (asignación %s)   \n",
            nombre_mecanismo(d->mec));
     printf("Bloques: %d de %d bytes | archivos entre %d y %d KB\n",
            d->total_bloques, d->bloque_bytes, d->min_kb, d->max_kb);

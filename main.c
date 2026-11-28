@@ -4,6 +4,9 @@
 #include <ctype.h>
 #include "disco.h"
 
+#define MAX_DISCO_MB 16384
+#define MAX_BLOQUE_KB 65536
+
 static void vaciar_entrada(void)
 {
     int ch;
@@ -11,13 +14,13 @@ static void vaciar_entrada(void)
         ;
 }
 
-static int pedir_entero(const char *mensaje, int minimo)
+static int pedir_entero(const char *mensaje, int minimo, int maximo)
 {
     int valor;
 
     for (;;) {
         printf("%s", mensaje);
-        if (scanf("%d", &valor) == 1 && valor >= minimo) {
+        if (scanf("%d", &valor) == 1 && valor >= minimo && valor <= maximo) {
             vaciar_entrada();
             return valor;
         }
@@ -26,7 +29,7 @@ static int pedir_entero(const char *mensaje, int minimo)
             exit(1);
         }
         vaciar_entrada();
-        printf("  Valor inválido (debe ser un entero >= %d).\n", minimo);
+        printf("  Valor inválido (debe ser un entero entre %d y %d).\n", minimo, maximo);
     }
 }
 
@@ -65,16 +68,17 @@ int main(int argc, char *argv[])
             velocidad = 1;
     }
 
-    printf("=== Simulador de asignación de archivos ===\n\n");
+    printf("Simulador de asignación de archivos\n\n");
 
-    int disco_mb = pedir_entero("Tamaño del disco (MB): ", 1);
-    int bloque_kb = pedir_entero("Tamaño de cada bloque (KB): ", 1);
+    int disco_mb = pedir_entero("Tamaño del disco (MB): ", 1, MAX_DISCO_MB);
+    int tope_bloque = disco_mb * 512 < MAX_BLOQUE_KB ? disco_mb * 512 : MAX_BLOQUE_KB;
+    int bloque_kb = pedir_entero("Tamaño de cada bloque (KB): ", 1, tope_bloque);
     Mecanismo mecanismo = pedir_mecanismo();
-    int min_kb = pedir_entero("Tamaño mínimo de archivo (KB): ", 1);
-    int max_kb = pedir_entero("Tamaño máximo de archivo (KB): ", min_kb);
+    int min_kb = pedir_entero("Tamaño mínimo de archivo (KB): ", 1, disco_mb * 1024);
+    int max_kb = pedir_entero("Tamaño máximo de archivo (KB): ", min_kb, disco_mb * 1024);
 
     if (disco_init(&disco, disco_mb, bloque_kb, mecanismo, min_kb, max_kb) != 0) {
-        fprintf(stderr, "Error: el disco debe tener al menos 2 bloques.\n");
+        fprintf(stderr, "Error: no se pudo inicializar el disco.\n");
         return 1;
     }
 

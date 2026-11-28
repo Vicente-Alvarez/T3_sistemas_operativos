@@ -2,38 +2,37 @@
 #include <stdlib.h>
 #include "disco.h"
 
-int eliminar_archivo_aleatorio(Disco *d)
+int elegir_archivo_activo(const Disco *d)
 {
-    int t = d->segundos;
-    int activos = 0;
-    for (int i = 0; i < d->n_archivos; i++)
-        if (d->archivos[i].activo)
-            activos++;
+    if (d->activos <= 0)
+        return -1;
 
-    if (activos == 0) {
-        printf("[t=%ds] ELIMINACION: no hay archivos activos\n", t);
-        return 0;
-    }
-
-    int elegido = rand() % activos;
-    int pos = -1;
+    int elegido = rand() % d->activos;
     for (int i = 0; i < d->n_archivos; i++) {
         if (!d->archivos[i].activo)
             continue;
-        if (elegido == 0) {
-            pos = i;
-            break;
-        }
+        if (elegido == 0)
+            return i;
         elegido--;
     }
+    return -1;
+}
 
-    int id = d->archivos[pos].id;
-    int liberados = d->archivos[pos].n_datos + d->archivos[pos].n_meta;
-    int tam_kb = d->archivos[pos].tam_kb;
+int eliminar_archivo_aleatorio(Disco *d)
+{
+    int pos = elegir_archivo_activo(d);
 
+    if (pos < 0) {
+        printf("[t=%ds] ELIMINACIÓN: no hay archivos activos\n", d->segundos);
+        return -1;
+    }
+
+    Archivo *arch = &d->archivos[pos];
+    int liberados = arch->n_datos + arch->n_meta;
+
+    printf("[t=%ds] ELIMINADO archivo #%d de %d KB, %d bloques liberados\n",
+           d->segundos, arch->id, arch->tam_kb, liberados);
+    disco_imprimir_archivo(d, pos);
     disco_liberar_archivo(d, pos);
-
-    printf("[t=%ds] ELIMINACION: archivo %d (%d KB) eliminado, %d bloques liberados\n",
-           t, id, tam_kb, liberados);
-    return 1;
+    return pos;
 }

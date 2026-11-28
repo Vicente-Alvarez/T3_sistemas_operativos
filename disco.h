@@ -67,6 +67,7 @@ int indice_cap(const Disco *d, int n_datos);
 
 void simulacion_ejecutar(Disco *d, int factor);
 
+int elegir_archivo_activo(const Disco *d);
 int eliminar_archivo_aleatorio(Disco *d);
 
 int acceder_posicion_aleatoria(Disco *d);
